@@ -134,6 +134,24 @@ WHERE id = ? AND preview = ''
         Ok(result.rows_affected() > 0)
     }
 
+    /// Candidates for repairing previews of older reference-backed user forks.
+    /// The caller must inspect the rollout metadata before treating a row as a fork.
+    pub async fn list_paginated_threads_without_preview(
+        &self,
+    ) -> anyhow::Result<Vec<(ThreadId, PathBuf)>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, rollout_path FROM threads \
+             WHERE preview = '' AND history_mode = 'paginated' \
+               AND attached_thread_parent_id IS NULL \
+               AND source IN ('cli', 'vscode', 'exec')",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        rows.into_iter()
+            .map(|(id, path)| Ok((ThreadId::try_from(id)?, PathBuf::from(path))))
+            .collect()
+    }
+
     /// List saved threads attached directly to the given parent, including archived threads.
     pub async fn list_attached_thread_ids(
         &self,
