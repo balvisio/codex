@@ -153,6 +153,7 @@ pub struct LocalThreadStore {
     live_writer_locks: Arc<LiveWriterLocks>,
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
+    fork_preview_backfill: Arc<OnceCell<()>>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
     /// Queue local history writers before they take a pool connection so readers
     /// can use the other connections while SQLite's single writer is busy.
@@ -284,6 +285,7 @@ impl LocalThreadStore {
             live_writer_locks: Arc::new(LiveWriterLocks::default()),
             writer_lock_coordinator,
             state_db,
+            fork_preview_backfill: Arc::new(OnceCell::new()),
             thread_history_db: Arc::new(OnceCell::new()),
             thread_history_writer: Arc::new(Semaphore::new(/* permits */ 1)),
             thread_data_cleanup: None,

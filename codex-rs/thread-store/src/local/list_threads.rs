@@ -47,6 +47,12 @@ pub(super) async fn list_threads(
     store: &LocalThreadStore,
     params: ListThreadsParams,
 ) -> ThreadStoreResult<ThreadPage> {
+    // Repair old forks before filtering or pagination can hide their empty index entries.
+    // Once per store keeps subsequent database-only picker queries inexpensive.
+    store
+        .fork_preview_backfill
+        .get_or_init(|| backfill_fork_previews(store))
+        .await;
     if params.sort_key == ThreadSortKey::SectionPosition {
         return list_section_threads(store, params).await;
     }
@@ -191,6 +197,80 @@ fn encode_cursor(cursor: Option<&codex_rollout::Cursor>) -> Option<String> {
     cursor
         .and_then(|cursor| serde_json::to_value(cursor).ok())
         .and_then(|value| value.as_str().map(str::to_owned))
+}
+
+async fn backfill_fork_previews(store: &LocalThreadStore) {
+    let Some(state_db) = store.state_db.as_ref() else {
+        return;
+    };
+    let candidates = match state_db.list_paginated_threads_without_preview().await {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            tracing::warn!("failed to find fork preview backfill candidates: {err}");
+            return;
+        }
+    };
+    for (thread_id, path) in candidates {
+        if let Err(err) = backfill_fork_preview(store, thread_id, path).await {
+            // A missing or damaged old rollout must not prevent listing other chats.
+            tracing::warn!(%thread_id, "failed to backfill fork preview: {err}");
+        }
+    }
+}
+
+async fn backfill_fork_preview(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    path: std::path::PathBuf,
+) -> ThreadStoreResult<()> {
+    let meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read fork metadata: {err}"),
+        })?
+        .meta;
+    if meta.id != thread_id
+        || meta.forked_from_id.is_none()
+        || meta.attached_thread
+        || meta.source.is_non_root_agent()
+    {
+        return Ok(());
+    }
+    let Some(base) = meta
+        .history_base
+        .filter(|base| base.end_ordinal_exclusive > 0)
+    else {
+        return Ok(());
+    };
+    let lineage = store.resolve_rollout_lineage(thread_id, Some(path)).await?;
+    let preview = lineage
+        .read_with_fallback(store, |lineage| async move {
+            let prefix = lineage.truncate_at(base).await?;
+            for segment in prefix.segments() {
+                let _guard = store.live_writer_locks.lock(segment.rollout_id()).await;
+                super::thread_history_materialization::materialize_to_sqlite_with_reads(
+                    store,
+                    segment.rollout_id(),
+                    segment.rollout_path.as_path(),
+                    &prefix.reads,
+                )
+                .await?;
+            }
+            super::thread_history::first_user_preview(store, &prefix).await
+        })
+        .await?;
+    if let Some(preview) = preview
+        && let Some(state_db) = store.state_db.as_ref()
+    {
+        // Do not overwrite a preview produced by a concurrent user message or repair.
+        state_db
+            .set_thread_preview_if_empty(thread_id, &preview)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to save inherited fork preview: {err}"),
+            })?;
+    }
+    Ok(())
 }
 
 async fn list_section_threads(

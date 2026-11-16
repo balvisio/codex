@@ -3048,6 +3048,263 @@ SELECT
     assert_eq!(counts, (0, 0, 0));
 }
 
+#[tokio::test]
+async fn listing_backfills_old_nested_fork_previews_before_pagination() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let parent = ThreadId::new();
+    create_paginated_thread(&store, parent).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: parent,
+            items: vec![
+                turn_started("parent-turn"),
+                preview_user_item(parent, "parent-turn", "inherited user message"),
+                user_message("inherited user message"),
+                turn_completed("parent-turn"),
+            ],
+        })
+        .await
+        .expect("append parent history");
+    let base = prepare_paginated_fork(&store, parent, ForkBoundary::Latest)
+        .await
+        .history_base
+        .expect("parent history base");
+    let child = ThreadId::new();
+    create_fork_without_preview(&store, child, parent, base).await;
+    let nested_base = prepare_paginated_fork(&store, child, ForkBoundary::Latest)
+        .await
+        .history_base
+        .expect("nested history base");
+    let nested = ThreadId::new();
+    create_fork_without_preview(&store, nested, child, nested_base).await;
+    let empty = ThreadId::new();
+    create_paginated_thread(&store, empty).await;
+    store
+        .persist_thread(empty, PersistContext::Standard)
+        .await
+        .unwrap();
+    seed_preview_backfill_metadata(&store, parent).await;
+    seed_preview_backfill_metadata(&store, empty).await;
+
+    let state = store.state_db().await.unwrap();
+    state
+        .set_thread_preview_if_empty(parent, "existing parent preview")
+        .await
+        .unwrap();
+    let before = state.get_thread(child).await.unwrap().unwrap();
+    assert_eq!(before.preview, None);
+    let mut params = fork_preview_list_params();
+    params.page_size = 1;
+    let mut ids = Vec::new();
+    loop {
+        let page = store
+            .list_threads(params.clone())
+            .await
+            .expect("list threads");
+        ids.extend(page.items.iter().map(|item| item.thread_id));
+        params.cursor = page.next_cursor;
+        if params.cursor.is_none() {
+            break;
+        }
+    }
+    ids.sort_by_key(ToString::to_string);
+    let mut expected = vec![parent, child, nested];
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(ids, expected);
+    for id in [child, nested] {
+        let metadata = state.get_thread(id).await.unwrap().unwrap();
+        assert_eq!(metadata.preview.as_deref(), Some("inherited user message"));
+        assert_eq!(metadata.first_user_message, None);
+    }
+    let after = state.get_thread(child).await.unwrap().unwrap();
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.recency_at, before.recency_at);
+    assert_eq!(
+        state
+            .get_thread(parent)
+            .await
+            .unwrap()
+            .unwrap()
+            .preview
+            .as_deref(),
+        Some("existing parent preview")
+    );
+    assert_eq!(
+        state
+            .get_thread(empty)
+            .await
+            .unwrap()
+            .unwrap()
+            .preview
+            .as_deref(),
+        None
+    );
+    let again = store
+        .list_threads(fork_preview_list_params())
+        .await
+        .unwrap();
+    assert_eq!(again.items.len(), 3);
+}
+
+#[tokio::test]
+async fn listing_does_not_backfill_from_messages_after_the_fork_boundary() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let parent = ThreadId::new();
+    create_paginated_thread(&store, parent).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: parent,
+            items: vec![
+                turn_started("before"),
+                turn_completed("before"),
+                turn_started("after"),
+                preview_user_item(parent, "after", "message outside the fork"),
+                user_message("message outside the fork"),
+                turn_completed("after"),
+            ],
+        })
+        .await
+        .expect("append parent history");
+    let base = prepare_paginated_fork(&store, parent, ForkBoundary::BeforeTurn("after".into()))
+        .await
+        .history_base
+        .expect("metadata and first turn precede the fork boundary");
+    let child = ThreadId::new();
+    create_fork_without_preview(&store, child, parent, base).await;
+    seed_preview_backfill_metadata(&store, parent).await;
+    let state = store.state_db().await.unwrap();
+    state
+        .set_thread_preview_if_empty(parent, "message outside the fork")
+        .await
+        .unwrap();
+    let page = store
+        .list_threads(fork_preview_list_params())
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.thread_id)
+            .collect::<Vec<_>>(),
+        vec![parent]
+    );
+    assert_eq!(
+        state
+            .get_thread(child)
+            .await
+            .unwrap()
+            .unwrap()
+            .preview
+            .as_deref(),
+        None
+    );
+}
+
+fn preview_user_item(thread_id: ThreadId, turn_id: &str, text: &str) -> RolloutItem {
+    completed_item(
+        thread_id,
+        turn_id,
+        TurnItem::UserMessage(UserMessageItem {
+            id: "user-preview".to_string(),
+            client_id: None,
+            content: vec![codex_protocol::user_input::UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+        }),
+    )
+}
+
+fn fork_preview_list_params() -> ListThreadsParams {
+    ListThreadsParams {
+        included_thread_ids: None,
+        page_size: 10,
+        cursor: None,
+        sort_key: ThreadSortKey::CreatedAt,
+        sort_direction: SortDirection::Desc,
+        allowed_sources: Vec::new(),
+        model_providers: None,
+        cwd_filters: None,
+        section: None,
+        project_id: None,
+        archived: false,
+        search_term: None,
+        relation_filter: None,
+        use_state_db_only: true,
+    }
+}
+
+async fn create_fork_without_preview(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    parent: ThreadId,
+    base: HistoryPosition,
+) {
+    store
+        .create_thread(CreateThreadParams {
+            attached_thread: false,
+            creator_user_id: None,
+            creator_account_id: None,
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: Some(parent),
+            parent_thread_id: None,
+            source: SessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            history_base: Some(base),
+            subagent_history_start_ordinal: None,
+            initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
+            runtime_workspace_roots: None,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(std::env::current_dir().expect("cwd")),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("create old fork");
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist old fork");
+    store.flush_thread(thread_id).await.expect("flush old fork");
+    seed_preview_backfill_metadata(store, thread_id).await;
+}
+
+async fn seed_preview_backfill_metadata(store: &LocalThreadStore, thread_id: ThreadId) {
+    store.flush_thread(thread_id).await.expect("flush fixture");
+    let path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .unwrap()
+        .meta;
+    let metadata =
+        codex_state::ThreadMetadataBuilder::new(thread_id, path, Utc::now(), meta.source)
+            .with_history_mode(ThreadHistoryMode::Paginated)
+            .with_cwd(meta.cwd)
+            .build("test-provider");
+    store
+        .state_db()
+        .await
+        .unwrap()
+        .upsert_thread(&metadata)
+        .await
+        .unwrap();
+}
+
 async fn projection_store(codex_home: &Path) -> LocalThreadStore {
     let config = test_config(codex_home);
     let state_db = codex_state::StateRuntime::init(
